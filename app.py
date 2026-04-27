@@ -16,7 +16,44 @@ os.environ["PYTHONWARNINGS"] = "ignore"
 st.set_page_config(page_title="NSE Stock AI", page_icon="📈", layout="wide")
 
 # ── GROQ API KEY — paste your new key here ────────────────
+# ── GROQ API KEY — load safely ───────────────────────────
+
+def load_groq_key():
+    key = os.environ.get("GROQ_API_KEY", "")
+    if key:
+        return key
+
+    env_path = os.path.join(os.path.dirname(__file__), ".env")
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("GROQ_API_KEY="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return ""
+
+# 👇 AFTER function
 GROQ_API_KEY = load_groq_key()
+
+
+# ── OpenRouter API KEY — load safely ─────────────────────
+def load_openrouter_key():
+    key = os.environ.get("OPENROUTER_API_KEY", "")
+    if key:
+        return key
+
+    env_path = os.path.join(os.path.dirname(__file__), ".env")
+    if os.path.exists(env_path):
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("OPENROUTER_API_KEY="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return ""
+
+# Default OpenRouter model (can be overridden with OPENROUTER_MODEL env var)
+OPENROUTER_API_KEY = load_openrouter_key()
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "gpt-4o-mini")
 
 st.markdown("""
 <style>
@@ -144,9 +181,92 @@ def get_price(symbol):
         pass
     return None
 
+POS_NEWS_WORDS = {
+    "beat", "beats", "growth", "surge", "up", "upgrade", "profit", "profits",
+    "record", "strong", "win", "wins", "order", "orders", "expansion", "rally"
+}
+NEG_NEWS_WORDS = {
+    "miss", "misses", "fall", "falls", "drop", "drops", "down", "downgrade",
+    "loss", "losses", "weak", "fraud", "probe", "penalty", "lawsuit", "selloff"
+}
+
+@st.cache_data(ttl=900)
+def get_news_signal(symbol, max_items=8):
+    try:
+        news = yf.Ticker(symbol).news or []
+    except:
+        news = []
+
+    items = []
+    score = 0
+    for n in news[:max_items]:
+        title = str(n.get("title", "")).strip()
+        if not title:
+            continue
+        lower = re.sub(r"[^a-z0-9 ]", " ", title.lower())
+        words = set(lower.split())
+        pos_hits = len(words & POS_NEWS_WORDS)
+        neg_hits = len(words & NEG_NEWS_WORDS)
+        score += (pos_hits - neg_hits)
+        ts = n.get("providerPublishTime")
+        published = datetime.fromtimestamp(ts).strftime("%d %b %H:%M") if ts else "N/A"
+        items.append({"title": title, "published": published, "url": n.get("link", "")})
+
+    if score >= 2:
+        label = "Bullish"
+    elif score <= -2:
+        label = "Bearish"
+    else:
+        label = "Neutral"
+
+    return {"label": label, "score": score, "items": items}
+
+
+def build_trade_plan(r, price, capital, risk_profile):
+    profile = str(risk_profile).lower()
+    risk_pct = {"low": 0.01, "medium": 0.015, "high": 0.02}.get(profile, 0.015)
+    max_alloc_pct = {"low": 0.20, "medium": 0.30, "high": 0.40}.get(profile, 0.30)
+
+    atr = max(sg(r, "atr_pct", 0.02) * price, price * 0.005)
+    pred = r.get("prediction", "DOWN")
+    conf = sg(r, "confidence", 50)
+    adx = sg(r, "adx", 20)
+
+    entry = float(price)
+    stop = round(max(entry - (1.5 * atr), 0.01), 2)
+    target1 = round(entry + (1.5 * atr), 2)
+    target2 = round(entry + (3.0 * atr), 2)
+
+    risk_amount = capital * risk_pct
+    per_share_risk = max(entry - stop, entry * 0.002)
+    qty_by_risk = int(risk_amount / per_share_risk) if per_share_risk > 0 else 0
+    qty_by_budget = int((capital * max_alloc_pct) / entry) if entry > 0 else 0
+    qty = max(min(qty_by_risk, qty_by_budget), 0)
+
+    invest_amount = round(qty * entry, 2)
+    est_risk = round(qty * per_share_risk, 2)
+    rr = round(((target1 - entry) / per_share_risk), 2) if per_share_risk > 0 else 0
+
+    action = "BUY"
+    if pred != "UP" or conf < 55 or adx < 18:
+        action = "WAIT"
+
+    return {
+        "action": action,
+        "entry": round(entry, 2),
+        "stop": stop,
+        "target1": target1,
+        "target2": target2,
+        "qty": qty,
+        "invest_amount": invest_amount,
+        "risk_amount": est_risk,
+        "risk_pct": risk_pct * 100,
+        "rr": rr,
+    }
+
 
 # ── Signals ───────────────────────────────────────────────
-def get_signals(r, price):
+def get_signals(r, price, news_sig=None):
     s      = []
     rsi    = sg(r, "rsi",           50)
     macd   = sg(r, "macd",          0)
@@ -216,10 +336,18 @@ def get_signals(r, price):
     s.append(("green" if ich else "red",
               f"Price {'above' if ich else 'below'} Ichimoku cloud — {'bullish' if ich else 'bearish'}"))
 
+    if news_sig:
+        if news_sig["label"] == "Bullish":
+            s.append(("green", f"News sentiment bullish (score {news_sig['score']:+d})"))
+        elif news_sig["label"] == "Bearish":
+            s.append(("red", f"News sentiment bearish (score {news_sig['score']:+d})"))
+        else:
+            s.append(("gray", f"News sentiment neutral (score {news_sig['score']:+d})"))
+
     return s
 
 
-def get_verdict(r, signals):
+def get_verdict(r, signals, news_sig=None):
     pred  = r.get("prediction", "DOWN")
     score = 3 if pred == "UP" else 0
     score += 1 if sg(r, "confidence", 50) > 63 else 0
@@ -227,6 +355,9 @@ def get_verdict(r, signals):
     score -= sum(1 for x in signals if x[0] == "red")
     score += 1 if sg(r, "adx", 20) > 25 else 0
     score += 1 if sg(r, "ich_cloud_pos", 0) else -1
+    if news_sig:
+        score += 1 if news_sig["label"] == "Bullish" else 0
+        score -= 1 if news_sig["label"] == "Bearish" else 0
 
     if score >= 8:   return "STRONG BUY",      "green"
     elif score >= 5: return "CONSIDER BUYING", "green"
@@ -236,7 +367,7 @@ def get_verdict(r, signals):
 
 
 # ── Build context for AI ──────────────────────────────────
-def build_context(r, price, company, signals, advice):
+def build_context(r, price, company, signals, advice, plan, news_sig, capital, risk_profile):
     pred   = r.get("prediction", "N/A")
     conf   = sg(r, "confidence",    50)
     acc    = sg(r, "accuracy",      60)
@@ -253,6 +384,8 @@ def build_context(r, price, company, signals, advice):
     sma50  = sg(r, "sma_50",        price)
     sma200 = sg(r, "sma_200",       price)
     atr    = sg(r, "atr_pct",       0.02) * price
+    thr    = sg(r, "threshold",     0.5)
+    valacc = sg(r, "val_accuracy",  acc)
     t1     = round(price + atr * 1.5, 2)
     t2     = round(price + atr * 3.0, 2)
     sl     = round(price - atr * 1.5, 2)
@@ -263,10 +396,24 @@ You have LIVE analysis data for {company}. Always use this data in your answers.
 
 STOCK: {company}
 Live Price: Rs.{price:,.2f}
-AI Prediction (3-day): {pred}
+AI Prediction (Tomorrow / 1-day): {pred}
 Confidence: {conf}%
 Model Accuracy: {acc}%
+Validation Accuracy: {valacc}%
+Decision Threshold: {thr}
 Verdict: {advice}
+News Sentiment: {news_sig['label']} (score {news_sig['score']:+d})
+
+USER PORTFOLIO:
+Capital: Rs.{capital:,.2f}
+Risk Profile: {risk_profile}
+Recommended Action: {plan['action']}
+Suggested Quantity: {plan['qty']}
+Suggested Invest Amount: Rs.{plan['invest_amount']:,.2f}
+Entry: Rs.{plan['entry']:,.2f} | Stop Loss: Rs.{plan['stop']:,.2f}
+Target 1: Rs.{plan['target1']:,.2f} | Target 2: Rs.{plan['target2']:,.2f}
+Risk Per Trade: {plan['risk_pct']:.2f}% | Est Risk Rs.{plan['risk_amount']:,.2f}
+Risk/Reward to Target1: {plan['rr']}
 
 TECHNICAL INDICATORS:
 RSI(14): {rsi:.1f} | MACD: {macd:.4f} | ADX: {adx:.1f}
@@ -287,42 +434,48 @@ SIGNALS:
 
 RULES:
 - Always give specific numbers from the data above
-- Be conversational and concise (3-5 sentences)
-- Always mention stop loss when discussing buying
+- Be conversational and concise (4-7 sentences)
+- Always include stop loss and amount to invest when user asks buy/sell questions
 - Be honest if signals are mixed
 - Do NOT say you lack real-time data — you have it above
+- If confidence is weak, clearly say WAIT and explain risk
 - Use Rs. for prices"""
 
 
-# ── Groq chat function ────────────────────────────────────
-def ask_groq(messages, context):
-    if GROQ_API_KEY == "paste_your_new_groq_key_here" or not GROQ_API_KEY:
-        return ("No API key set. Open app.py and paste your Groq API key "
-                "at the top where it says GROQ_API_KEY = '...'")
+# ── OpenRouter chat function ───────────────────────────────
+def ask_openrouter(messages, context):
+    if not OPENROUTER_API_KEY:
+        return (
+            "No API key set. Set OPENROUTER_API_KEY in your environment or .env file "
+            "(see https://openrouter.ai for details)."
+        )
     try:
         payload = {
-            "model": "llama-3.3-70b-versatile",
+            "model": OPENROUTER_MODEL,
             "messages": [{"role": "system", "content": context}] + messages,
             "max_tokens": 800,
-            "temperature": 0.6
+            "temperature": 0.6,
         }
         resp = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
+            "https://api.openrouter.ai/v1/chat/completions",
             headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json"
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
             },
             json=payload,
-            timeout=30
+            timeout=30,
         )
         if resp.status_code == 200:
-            return resp.json()["choices"][0]["message"]["content"]
+            data = resp.json()
+            if isinstance(data, dict) and data.get("choices"):
+                return data["choices"][0].get("message", {}).get("content", "")
+            return str(data)
         elif resp.status_code == 401:
-            return "Invalid API key. Go to console.groq.com and get a new free key."
+            return "Invalid API key. Check your OpenRouter key and account."
         elif resp.status_code == 429:
-            return "Rate limit hit. Wait 30 seconds and try again (free tier limit)."
+            return "Rate limit hit. Wait and try again."
         else:
-            return f"Groq API error {resp.status_code}: {resp.text[:200]}"
+            return f"OpenRouter API error {resp.status_code}: {resp.text[:200]}"
     except requests.exceptions.Timeout:
         return "Request timed out. Check your internet and try again."
     except Exception as e:
@@ -371,7 +524,10 @@ with st.sidebar:
     st.metric("Stocks trained", len(all_results))
     st.markdown("**Model:** RF + ET + GBM + LR")
     st.markdown("**Features:** 65 indicators")
-    st.markdown("**Chat:** Groq LLaMA 70B (Free)")
+    st.markdown("**Chat:** OpenRouter (set OPENROUTER_MODEL to choose model)")
+    st.markdown("---")
+    capital = st.number_input("Your Capital (Rs.)", min_value=1000.0, value=100000.0, step=1000.0)
+    risk_profile = st.selectbox("Risk Profile", ["Low", "Medium", "High"], index=1)
 
     st.markdown("---")
     if st.button("🔄 Refresh Price", use_container_width=True):
@@ -408,8 +564,10 @@ if "chat_history" not in st.session_state:
 if "api_messages" not in st.session_state:
     st.session_state.api_messages = []
 
-signals    = get_signals(r, price)
-advice, vc = get_verdict(r, signals)
+news_sig = get_news_signal(selected)
+signals = get_signals(r, price, news_sig)
+advice, vc = get_verdict(r, signals, news_sig)
+plan = build_trade_plan(r, price, capital, risk_profile)
 
 # ── Header ────────────────────────────────────────────────
 h1, h2 = st.columns([3, 1])
@@ -433,16 +591,29 @@ prob = sg(r, "prob_up",     50)
 m1,m2,m3,m4,m5,m6 = st.columns(6)
 arrow = "▲" if change >= 0 else "▼"
 m1.metric("Live Price",    f"Rs.{price:,.2f}", f"{arrow} {abs(pct):.2f}%")
-m2.metric("AI Prediction", pred,               f"Prob UP: {prob}%")
+m2.metric("Tomorrow", pred,                    f"Prob UP: {prob}%")
 m3.metric("Confidence",    f"{conf}%")
 m4.metric("Test Accuracy", f"{acc}%")
-m5.metric("CV Accuracy",   f"{cv}%")
-m6.metric("ADX (Trend)",   f"{adx:.0f}",       "Strong" if adx > 25 else "Weak")
+val_acc = sg(r, "val_accuracy", cv)
+m5.metric("Validation",    f"{val_acc}%")
+m6.metric("News",          news_sig["label"],  f"Score: {news_sig['score']:+d}")
 
 st.markdown("---")
 
 # ── Verdict ───────────────────────────────────────────────
 st.markdown(f'<div class="verdict-{vc}">{advice}</div>', unsafe_allow_html=True)
+st.markdown("### 💰 Investment Plan")
+p1, p2, p3, p4, p5 = st.columns(5)
+p1.metric("Action", plan["action"])
+p2.metric("Invest Amount", f"Rs.{plan['invest_amount']:,.0f}")
+p3.metric("Qty", f"{plan['qty']}")
+p4.metric("Stop Loss", f"Rs.{plan['stop']:,.2f}")
+p5.metric("Target 1", f"Rs.{plan['target1']:,.2f}")
+
+st.caption(
+    f"Risk profile: {risk_profile} | Risk per trade: {plan['risk_pct']:.2f}% | "
+    f"Estimated risk: Rs.{plan['risk_amount']:,.0f} | R:R (T1): {plan['rr']}"
+)
 
 # ── Indicators ────────────────────────────────────────────
 st.markdown("### 📊 Key Indicators")
@@ -478,19 +649,25 @@ for i, (color, msg) in enumerate(signals):
     safe = html.escape(msg)
     tgt.markdown(f'<div class="sig-{color}">{safe}</div>', unsafe_allow_html=True)
 
+if news_sig["items"]:
+    st.markdown("### 📰 Latest News Snapshot")
+    for item in news_sig["items"][:5]:
+        title = html.escape(item["title"])
+        st.markdown(f"- {title}  \n  *{item['published']}*")
+
 st.markdown("---")
 
 # ══════════════════════════════════════════════════════════
 # AI CHAT — shown BEFORE charts so you see it without scroll
 # ══════════════════════════════════════════════════════════
 st.markdown("### 🤖 Chat with Stock AI")
-st.caption(f"Powered by **Groq LLaMA 70B** (free) | Knows all data for **{company}**")
+st.caption(f"Powered by **Groq LLaMA 70B** (free) | Tomorrow view + risk sizing for **{company}**")
 
 # API key warning
-if GROQ_API_KEY == "paste_your_new_groq_key_here":
-    st.warning("⚠️ Groq API key not set. Open app.py and paste your key at the top.")
+if not OPENROUTER_API_KEY:
+    st.warning("⚠️ OpenRouter API key not set. Set OPENROUTER_API_KEY in your environment or .env.")
 
-context = build_context(r, price, company, signals, advice)
+context = build_context(r, price, company, signals, advice, plan, news_sig, capital, risk_profile)
 
 # Chat history display
 if st.session_state.chat_history:
@@ -509,8 +686,8 @@ if st.session_state.chat_history:
 st.markdown("**Quick questions:**")
 qcols = st.columns(4)
 quick = [
-    "Should I buy this stock now?",
-    "What is the price target?",
+    "What can happen tomorrow?",
+    "How much should I invest now?",
     "What is the risk level?",
     "Explain all signals",
 ]
@@ -542,7 +719,7 @@ if question:
     st.session_state.api_messages.append({"role": "user", "content": question})
 
     with st.spinner("AI thinking..."):
-        reply = ask_groq(st.session_state.api_messages, context)
+        reply = ask_openrouter(st.session_state.api_messages, context)
 
     st.session_state.chat_history.append({"role": "assistant", "content": reply})
     st.session_state.api_messages.append({"role": "assistant", "content": reply})
@@ -646,4 +823,4 @@ st.markdown("---")
 st.caption(f"Trained: {r.get('trained_at','N/A')} | "
            f"Time: {sg(r,'elapsed_sec',0):.0f}s | "
            f"Features: {len(fi) if fi else 'N/A'} | "
-           f"Chat: Groq LLaMA 70B (Free)")
+           f"Chat: OpenRouter (model={OPENROUTER_MODEL})")

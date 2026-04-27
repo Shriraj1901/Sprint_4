@@ -15,8 +15,14 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import accuracy_score
-from sklearn.feature_selection import SelectFromModel
-from sklearn.pipeline import Pipeline
+try:
+    from xgboost import XGBClassifier
+except Exception:
+    XGBClassifier = None
+try:
+    from lightgbm import LGBMClassifier
+except Exception:
+    LGBMClassifier = None
 
 # ── Load stock list ───────────────────────────────────────
 if not os.path.exists("nse_stocks.pkl"):
@@ -63,10 +69,24 @@ FEATURES = [
     # Ichimoku
     "TENKAN","KIJUN","SENKOU_A","SENKOU_B",
     "ICH_cloud_pos",
+    # Extra analyzers (regime / structure)
+    "Trend_strength","Volatility_20","Vol_regime","Breakout_20","Breakdown_20","Gap_pct",
+    # Market-context analyzers (NIFTY + relative strength)
+    "MKT_ret_1d","MKT_ret_3d","MKT_ret_5d","MKT_rsi_14","MKT_trend_20_50","MKT_vol_10",
+    "Rel_5","Rel_20","Beta_60","Corr_20",
     # Time features
     "Day_of_week","Month","Quarter","Week_of_year",
     "Is_month_start","Is_month_end","Is_quarter_end",
 ]
+
+PRED_HORIZON_DAYS = 1
+FLAT_MOVE_ATR_MULT = 0.7
+TRAIN_RATIO = 0.70
+VAL_RATIO = 0.15
+USE_XGB = True
+USE_LGBM = True
+MARKET_SYMBOL = "^NSEI"
+_MARKET_CACHE = None
 
 def flatten_columns(df):
     if isinstance(df.columns, pd.MultiIndex):
@@ -78,6 +98,98 @@ def get_col(df, prefix):
     if not match:
         raise KeyError(f"No column with prefix '{prefix}'")
     return match[0]
+
+def load_market_data(end_date):
+    global _MARKET_CACHE
+    if _MARKET_CACHE is not None and not _MARKET_CACHE.empty:
+        return _MARKET_CACHE.copy()
+
+    mkt = yf.download(
+        MARKET_SYMBOL, start="2014-01-01", end=end_date,
+        progress=False, auto_adjust=True
+    )
+    if mkt is None or mkt.empty:
+        _MARKET_CACHE = pd.DataFrame()
+        return _MARKET_CACHE.copy()
+
+    mkt = flatten_columns(mkt)
+    mkt = mkt[[c for c in ["Open", "High", "Low", "Close", "Volume"] if c in mkt.columns]].copy()
+    mkt = mkt.replace([np.inf, -np.inf], np.nan).dropna()
+    _MARKET_CACHE = mkt
+    return _MARKET_CACHE.copy()
+
+def add_market_features(df, market_df):
+    if market_df is None or market_df.empty:
+        for col in ["MKT_ret_1d","MKT_ret_3d","MKT_ret_5d","MKT_rsi_14","MKT_trend_20_50","MKT_vol_10","Rel_5","Rel_20","Beta_60","Corr_20"]:
+            df[col] = 0.0
+        return df
+
+    m = market_df.reindex(df.index).copy()
+    m["MKT_ret_1d"] = m["Close"].pct_change(1)
+    m["MKT_ret_3d"] = m["Close"].pct_change(3)
+    m["MKT_ret_5d"] = m["Close"].pct_change(5)
+    m["MKT_rsi_14"] = ta.rsi(m["Close"], length=14)
+    m["MKT_sma20"] = ta.sma(m["Close"], length=20)
+    m["MKT_sma50"] = ta.sma(m["Close"], length=50)
+    m["MKT_trend_20_50"] = ((m["MKT_sma20"] > m["MKT_sma50"]).astype(float))
+    m["MKT_vol_10"] = m["MKT_ret_1d"].rolling(10).std()
+
+    sret1 = df["Close"].pct_change(1)
+    mret1 = m["MKT_ret_1d"]
+    mret5 = m["Close"].pct_change(5)
+    mret20 = m["Close"].pct_change(20)
+
+    df["MKT_ret_1d"] = mret1
+    df["MKT_ret_3d"] = m["MKT_ret_3d"]
+    df["MKT_ret_5d"] = m["MKT_ret_5d"]
+    df["MKT_rsi_14"] = m["MKT_rsi_14"]
+    df["MKT_trend_20_50"] = m["MKT_trend_20_50"]
+    df["MKT_vol_10"] = m["MKT_vol_10"]
+    df["Rel_5"] = df["Close"].pct_change(5) - mret5
+    df["Rel_20"] = df["Close"].pct_change(20) - mret20
+    # Rolling beta and correlation against NIFTY
+    cov = sret1.rolling(60).cov(mret1)
+    var = mret1.rolling(60).var()
+    df["Beta_60"] = cov / (var + 1e-9)
+    df["Corr_20"] = sret1.rolling(20).corr(mret1)
+    return df
+
+def tune_weighted_ensemble(val_probs, y_val, step=0.1):
+    n_models = len(val_probs)
+    if n_models == 1:
+        return [1.0], 0.5, accuracy_score(y_val, (val_probs[0] > 0.5).astype(int))
+
+    rng = np.random.default_rng(42)
+    best_w = [1.0 / n_models] * n_models
+    best_thr = 0.5
+    best_acc = -1.0
+    ties = None
+
+    candidates = [np.array(best_w, dtype=float)]
+    for i in range(n_models):
+        one = np.zeros(n_models, dtype=float)
+        one[i] = 1.0
+        candidates.append(one)
+    # random convex combinations keep search fast per stock
+    for _ in range(120):
+        candidates.append(rng.dirichlet(np.ones(n_models)))
+
+    for w in candidates:
+        ens = np.zeros_like(val_probs[0], dtype=float)
+        for i in range(n_models):
+            ens += w[i] * val_probs[i]
+        # Threshold search
+        for thr in np.arange(0.35, 0.66, 0.01):
+            pred = (ens > thr).astype(int)
+            acc = accuracy_score(y_val, pred)
+            tie_break = (abs(thr - 0.5), np.count_nonzero(w), -w.max())
+            if (acc > best_acc) or (abs(acc - best_acc) < 1e-12 and (ties is None or tie_break < ties)):
+                best_acc = acc
+                best_w = w.tolist()
+                best_thr = float(thr)
+                ties = tie_break
+
+    return best_w, best_thr, best_acc
 
 def add_features(df):
     close  = df["Close"]
@@ -223,6 +335,14 @@ def add_features(df):
 
     df["ICH_cloud_pos"] = (close > df[["SENKOU_A","SENKOU_B"]].max(axis=1)).astype(int)
 
+    # Extra analyzers (regime / structure)
+    df["Trend_strength"] = (df["EMA_21"] - df["EMA_50"]) / (close + 1e-9)
+    df["Volatility_20"] = close.pct_change().rolling(20).std()
+    df["Vol_regime"] = df["Volatility_20"] / (df["Volatility_20"].rolling(100).mean() + 1e-9)
+    df["Breakout_20"] = (close > high.shift(1).rolling(20).max()).astype(int)
+    df["Breakdown_20"] = (close < low.shift(1).rolling(20).min()).astype(int)
+    df["Gap_pct"] = (open_ - close.shift(1)) / (close.shift(1) + 1e-9)
+
     # ── Time features ─────────────────────────────────────
     df["Day_of_week"]   = df.index.dayofweek
     df["Month"]         = df.index.month
@@ -258,13 +378,20 @@ def train_stock(symbol):
     except Exception as e:
         return None, f"feature error: {e}"
 
+    # Add broader market context analyzers (NIFTY regime + relative strength)
+    market_df = load_market_data(end_date)
+    df = add_market_features(df, market_df)
+
     # Replace inf values
     df = df.replace([np.inf, -np.inf], np.nan)
 
-    # TARGET — predict 3-day direction (smoother signal)
-    future_close = df["Close"].shift(-3)
+    # TARGET — predict 1-day direction with flat-move filtering
+    future_close = df["Close"].shift(-PRED_HORIZON_DAYS)
+    future_ret = (future_close - df["Close"]) / (df["Close"] + 1e-9)
+    flat_cutoff = (df["ATR_pct"] * FLAT_MOVE_ATR_MULT).clip(lower=0.001)
+    valid_move = future_ret.abs() > flat_cutoff
     df["Target"] = np.where(
-        future_close.notna(),
+        future_close.notna() & valid_move,
         (future_close > df["Close"]).astype(int),
         np.nan
     )
@@ -289,68 +416,132 @@ def train_stock(symbol):
     tscv   = TimeSeriesSplit(n_splits=5)
     scores = []
     for tr_idx, te_idx in tscv.split(X):
-        rf_cv = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+        rf_cv = RandomForestClassifier(
+            n_estimators=120, random_state=42, n_jobs=-1, class_weight="balanced_subsample"
+        )
         rf_cv.fit(X.iloc[tr_idx], y.iloc[tr_idx])
         scores.append(accuracy_score(y.iloc[te_idx], rf_cv.predict(X.iloc[te_idx])))
     cv_acc = np.mean(scores) * 100
 
     # ── Final ensemble — 4 models ─────────────────────────
-    split    = int(len(X) * 0.85)
-    X_train  = X.iloc[:split]; X_test  = X.iloc[split:]
-    y_train  = y.iloc[:split]; y_test  = y.iloc[split:]
+    n = len(X)
+    tr_end = int(n * TRAIN_RATIO)
+    val_end = int(n * (TRAIN_RATIO + VAL_RATIO))
+    if tr_end < 200 or (val_end - tr_end) < 40 or (n - val_end) < 40:
+        return None, "insufficient samples after target filtering"
+
+    X_train = X.iloc[:tr_end]
+    y_train = y.iloc[:tr_end]
+    X_val = X.iloc[tr_end:val_end]
+    y_val = y.iloc[tr_end:val_end]
+    X_test = X.iloc[val_end:]
+    y_test = y.iloc[val_end:]
 
     # Model 1 — Random Forest (best for this task)
     rf = RandomForestClassifier(
-        n_estimators=500, max_depth=15, min_samples_split=15,
+        n_estimators=600, max_depth=16, min_samples_split=12,
         min_samples_leaf=5, max_features="sqrt",
-        random_state=42, n_jobs=-1
+        class_weight="balanced_subsample", random_state=42, n_jobs=-1
     )
 
     # Model 2 — Extra Trees (faster, different bias)
     et = ExtraTreesClassifier(
-        n_estimators=300, max_depth=12, min_samples_split=20,
-        random_state=42, n_jobs=-1
+        n_estimators=400, max_depth=14, min_samples_split=14,
+        class_weight="balanced", random_state=42, n_jobs=-1
     )
 
     # Model 3 — Gradient Boosting (sequential, catches different patterns)
     gb = GradientBoostingClassifier(
-        n_estimators=200, max_depth=4, learning_rate=0.05,
+        n_estimators=250, max_depth=3, learning_rate=0.04,
         subsample=0.8, random_state=42
     )
 
     # Model 4 — Logistic Regression on scaled features (linear patterns)
     scaler = StandardScaler()
     X_tr_sc = scaler.fit_transform(X_train)
+    X_val_sc = scaler.transform(X_val)
     X_te_sc = scaler.transform(X_test)
-    lr = LogisticRegression(max_iter=1000, random_state=42, n_jobs=-1)
+    lr = LogisticRegression(max_iter=1200, class_weight="balanced", random_state=42, n_jobs=-1)
 
     rf.fit(X_train, y_train)
     et.fit(X_train, y_train)
     gb.fit(X_train, y_train)
     lr.fit(X_tr_sc, y_train)
 
-    # Weighted ensemble — RF gets most weight (best performer)
+    # Advanced ensemble: adaptive weights + optional boosters
+    xgb = None
+    lgbm = None
+    val_probs = []
+    test_probs = []
+    latest_probs = []
+    model_names = []
+
+    rf_prob_val = rf.predict_proba(X_val)[:, 1]
+    et_prob_val = et.predict_proba(X_val)[:, 1]
+    gb_prob_val = gb.predict_proba(X_val)[:, 1]
+    lr_prob_val = lr.predict_proba(X_val_sc)[:, 1]
     rf_prob = rf.predict_proba(X_test)[:, 1]
     et_prob = et.predict_proba(X_test)[:, 1]
     gb_prob = gb.predict_proba(X_test)[:, 1]
     lr_prob = lr.predict_proba(X_te_sc)[:, 1]
 
-    ensemble    = (rf_prob * 0.45 + et_prob * 0.25 + gb_prob * 0.20 + lr_prob * 0.10)
-    final_pred  = (ensemble > 0.5).astype(int)
+    latest_x = X.iloc[-1:].fillna(X.median())
+    latest_sc = scaler.transform(latest_x)
+
+    val_probs.extend([rf_prob_val, et_prob_val, gb_prob_val, lr_prob_val])
+    test_probs.extend([rf_prob, et_prob, gb_prob, lr_prob])
+    latest_probs.extend([
+        rf.predict_proba(latest_x)[0][1],
+        et.predict_proba(latest_x)[0][1],
+        gb.predict_proba(latest_x)[0][1],
+        lr.predict_proba(latest_sc)[0][1],
+    ])
+    model_names.extend(["rf", "et", "gb", "lr"])
+
+    if USE_XGB and XGBClassifier is not None:
+        try:
+            xgb = XGBClassifier(
+                n_estimators=260, max_depth=5, learning_rate=0.04,
+                subsample=0.85, colsample_bytree=0.85, reg_lambda=1.0,
+                objective="binary:logistic", random_state=42, n_jobs=-1, eval_metric="logloss"
+            )
+            xgb.fit(X_train, y_train)
+            val_probs.append(xgb.predict_proba(X_val)[:, 1])
+            test_probs.append(xgb.predict_proba(X_test)[:, 1])
+            latest_probs.append(xgb.predict_proba(latest_x)[0][1])
+            model_names.append("xgb")
+        except Exception:
+            xgb = None
+
+    if USE_LGBM and LGBMClassifier is not None:
+        try:
+            lgbm = LGBMClassifier(
+                n_estimators=280, learning_rate=0.04, num_leaves=31,
+                subsample=0.85, colsample_bytree=0.85, random_state=42
+            )
+            lgbm.fit(X_train, y_train)
+            val_probs.append(lgbm.predict_proba(X_val)[:, 1])
+            test_probs.append(lgbm.predict_proba(X_test)[:, 1])
+            latest_probs.append(lgbm.predict_proba(latest_x)[0][1])
+            model_names.append("lgbm")
+        except Exception:
+            lgbm = None
+
+    best_weights, best_thr, best_val_acc = tune_weighted_ensemble(val_probs, y_val, step=0.1)
+    ensemble = np.zeros_like(test_probs[0], dtype=float)
+    for w, p in zip(best_weights, test_probs):
+        ensemble += w * p
+    final_pred  = (ensemble > best_thr).astype(int)
     final_acc   = accuracy_score(y_test, final_pred) * 100
 
-    # ── Predict latest ────────────────────────────────────
-    latest    = X.iloc[-1:].fillna(X.median())
-    latest_sc = scaler.transform(latest)
+    # Predict latest
+    prob_up = float(sum(w * p for w, p in zip(best_weights, latest_probs)))
 
-    prob_up = (
-        rf.predict_proba(latest)[0][1] * 0.45 +
-        et.predict_proba(latest)[0][1] * 0.25 +
-        gb.predict_proba(latest)[0][1] * 0.20 +
-        lr.predict_proba(latest_sc)[0][1] * 0.10
-    )
-    pred = "UP" if prob_up > 0.5 else "DOWN"
-    conf = round(max(prob_up, 1 - prob_up) * 100, 2)
+    pred = "UP" if prob_up > best_thr else "DOWN"
+    if prob_up > best_thr:
+        conf = round(((prob_up - best_thr) / (1 - best_thr + 1e-9)) * 100, 2)
+    else:
+        conf = round(((best_thr - prob_up) / (best_thr + 1e-9)) * 100, 2)
 
     # ── Feature importance (from RF) ─────────────────────
     fi = dict(zip(FEATURES, rf.feature_importances_))
@@ -375,6 +566,10 @@ def train_stock(symbol):
         "symbol"        : symbol,
         "accuracy"      : round(final_acc, 2),
         "cv_accuracy"   : round(cv_acc, 2),
+        "val_accuracy"  : round(best_val_acc * 100, 2),
+        "threshold"     : round(best_thr, 2),
+        "ensemble_models": model_names,
+        "ensemble_weights": [round(float(w), 2) for w in best_weights],
         "prediction"    : pred,
         "confidence"    : conf,
         "prob_up"       : round(prob_up * 100, 2),
@@ -398,9 +593,12 @@ def train_stock(symbol):
         "feature_importance": fi,
         "trained_at"    : time.strftime("%Y-%m-%d %H:%M"),
         "elapsed_sec"   : round(time.time() - t0, 1),
+        "samples_train" : int(len(X_train)),
+        "samples_val"   : int(len(X_val)),
+        "samples_test"  : int(len(X_test)),
     }
 
-    return (result, rf, et, gb, scaler), None
+    return (result, rf, et, gb, lr, xgb, lgbm, scaler, best_thr, best_weights, model_names), None
 
 
 # ════════════════════════════════════════════════════════
@@ -409,14 +607,18 @@ def train_stock(symbol):
 
 os.makedirs("models", exist_ok=True)
 results_path = "models/all_results.pkl"
+FORCE_RETRAIN = os.environ.get("FORCE_RETRAIN", "0") == "1"
 
-if os.path.exists(results_path):
+if os.path.exists(results_path) and not FORCE_RETRAIN:
     with open(results_path, "rb") as f:
         all_results = pickle.load(f)
     print(f"Resuming — {len(all_results)} already done")
 else:
     all_results = {}
-    print("Starting fresh")
+    if FORCE_RETRAIN:
+        print("Starting fresh (FORCE_RETRAIN=1)")
+    else:
+        print("Starting fresh")
 
 remaining = [s for s in STOCKS if s not in all_results]
 total     = len(STOCKS)
@@ -450,12 +652,15 @@ for i, stock in enumerate(remaining, 1):
         failed.append((stock, err))
         continue
 
-    result, rf, et, gb, scaler = out
+    result, rf, et, gb, lr, xgb, lgbm, scaler, best_thr, best_weights, model_names = out
     all_results[stock] = result
 
     with open(f"models/{stock.replace('.','_')}.pkl", "wb") as f:
-        pickle.dump({"rf": rf, "et": et, "gb": gb,
-                     "scaler": scaler, "features": FEATURES}, f)
+        pickle.dump({
+            "rf": rf, "et": et, "gb": gb, "lr": lr, "xgb": xgb, "lgbm": lgbm,
+            "scaler": scaler, "features": FEATURES, "threshold": best_thr,
+            "ensemble_weights": best_weights, "ensemble_models": model_names
+        }, f)
 
     saved_n += 1
     if saved_n % 10 == 0:
@@ -475,3 +680,6 @@ with open(results_path, "wb") as f:
 mins = (time.time() - t_start) / 60
 print(f"\nDONE! Trained {len(all_results)} in {mins:.0f} mins | Failed: {len(failed)}")
 print("Run: python -m streamlit run app.py")
+
+
+
