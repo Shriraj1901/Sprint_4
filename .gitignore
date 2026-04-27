@@ -1,0 +1,11 @@
+# Never push these
+models/
+__pycache__/
+*.pkl
+*.pyc
+.env
+nse_stocks.csv
+chart.png
+
+# Keep nse_stocks.pkl out too (large file)
+nse_stocks.pkl
