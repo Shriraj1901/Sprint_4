@@ -8,3 +8,4 @@ matplotlib
 requests
 xgboost
 lightgbm
+plotly
